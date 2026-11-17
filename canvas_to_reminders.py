@@ -74,7 +74,7 @@ def due_arg(due):
 
 
 def find_remctl():
-    override = os.environ.get("/Users/ej/bin/remctl")
+    override = os.environ.get("REMCTL_PATH")
     if override and Path(override).expanduser().exists():
         return str(Path(override).expanduser())
     found = shutil.which("remctl")
@@ -87,13 +87,21 @@ def find_remctl():
 
 
 def build_command(event, list_name=None, remctl="remctl"):
-    cmd = [remctl, "add", "-d", due_arg(event["due"])]
+    cmd = [remctl, "add", "--json", "-d", due_arg(event["due"])]
     if list_name:
         cmd += ["-l", list_name]
     if event["url"]:
         cmd += ["--url", event["url"]]
     cmd += ["--", event["title"]]
     return cmd
+
+
+def build_edit_command(event, remctl, reminder_id):
+    return [
+        remctl, "edit", str(reminder_id),
+        "--title", event["title"],
+        "-d", due_arg(event["due"]),
+    ]
 
 
 # ---------- Step 5: remember what was already added ----------
@@ -110,38 +118,87 @@ def save_state(path, state):
     tmp.replace(path)
 
 
+def has_changed(entry, event):
+    return entry["title"] != event["title"] or entry["due"] != str(event["due"])
+
+
+def run_add(cmd):
+    result = subprocess.run(cmd, check=True, capture_output=True, text=True)
+    try:
+        return json.loads(result.stdout).get("numericId")
+    except (json.JSONDecodeError, AttributeError):
+        return None
+
+
 def sync(events, list_name, state_path, apply, remctl):
     state = load_state(state_path)
-    added = skipped = failed = 0
+    added = updated = skipped = failed = 0
 
     for event in sorted(events, key=lambda e: due_day(e["due"])):
-        if event["uid"] in state:
+        entry = state.get(event["uid"])
+
+        if entry is not None and not has_changed(entry, event):
             skipped += 1
             continue
 
-        cmd = build_command(event, list_name, remctl)
+        if entry is None:
+            cmd = build_command(event, list_name, remctl)
+        elif entry.get("id"):
+            cmd = build_edit_command(event, remctl, entry["id"])
+        else:
+            print(
+                f"CAN'T UPDATE: {event['title']} changed in Canvas, but no "
+                "reminder ID was saved for it (added by an older version).",
+                file=sys.stderr,
+            )
+            failed += 1
+            continue
+
+        label = "add" if entry is None else "update"
         if not apply:
-            print("[dry run]", shlex.join(cmd))
-            added += 1
+            print(f"[dry run] {label}:", shlex.join(cmd))
+            if entry is None:
+                added += 1
+            else:
+                updated += 1
             continue
 
         try:
-            subprocess.run(cmd, check=True)
-        except (subprocess.CalledProcessError, FileNotFoundError) as err:
-            print(f"FAILED: {event['title']} ({err})", file=sys.stderr)
+            if entry is None:
+                reminder_id = run_add(cmd)
+                if reminder_id is None:
+                    print(f"Note: no reminder ID returned for {event['title']}; "
+                          "future changes to it can't be applied automatically.",
+                          file=sys.stderr)
+            else:
+                subprocess.run(cmd, check=True, capture_output=True, text=True)
+                reminder_id = entry["id"]
+        except subprocess.CalledProcessError as err:
+            print(f"FAILED to {label}: {event['title']} ({err.stderr.strip() or err})",
+                  file=sys.stderr)
+            failed += 1
+            continue
+        except FileNotFoundError as err:
+            print(f"FAILED to {label}: {event['title']} ({err})", file=sys.stderr)
             failed += 1
             continue
 
         state[event["uid"]] = {
             "title": event["title"],
             "due": str(event["due"]),
-            "added": datetime.now(LOCAL_TZ).isoformat(timespec="seconds"),
+            "id": reminder_id,
+            "added": (entry or {}).get("added")
+            or datetime.now(LOCAL_TZ).isoformat(timespec="seconds"),
         }
         save_state(state_path, state)
-        added += 1
+        if entry is None:
+            added += 1
+        else:
+            updated += 1
 
     verb = "created" if apply else "would create"
-    print(f"\n{verb}: {added} | already added: {skipped} | failed: {failed}")
+    verb2 = "updated" if apply else "would update"
+    print(f"\n{verb}: {added} | {verb2}: {updated} | unchanged: {skipped} | failed: {failed}")
 
 
 # ---------- Command line ----------
